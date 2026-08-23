@@ -31,6 +31,27 @@ def main():
     ap.add_argument("--max_tokens", type=int, default=20_000_000,
                      help="суммарный бюджет токенов обучения (<=100M по заданию)")
     ap.add_argument("--n_loops_train", type=int, default=8)
+    ap.add_argument("--use_step_scale", action="store_true",
+                     help="гипотеза 1 (умная): обучаемый scale(t) на выходе блока, "
+                          "зависящий от номера лупа, без истории")
+    ap.add_argument("--use_loop_norm", action="store_true",
+                     help="структурная альтернатива гипотезе 1: RMSNorm residual "
+                          "stream после каждого лупа, не зависит от t вообще")
+    ap.add_argument("--use_loop_index_film", action="store_true",
+                     help="гипотеза 2 в чистом виде: FiLM-модуляция ВХОДА блока "
+                          "сигналом t (блок обрабатывает разные шаги по-разному, "
+                          "а не просто получает разный вес на готовом выходе)")
+    ap.add_argument("--use_trajectory", action="store_true",
+                     help="гипотеза 4 полная (комбинированная): momentum + "
+                          "GRU-память истории + trajectory-conditioned gate + "
+                          "FiLM от истории, объединённые в один механизм")
+    ap.add_argument("--use_momentum", action="store_true",
+                     help="гипотеза 4, подпункт 1 изолированно: только "
+                          "momentum/velocity на входе блока, без gate и памяти")
+    ap.add_argument("--use_gru_controller", action="store_true",
+                     help="гипотеза 4, подпункт 3 изолированно: только "
+                          "GRU-память + FiLM, без отдельного output-gate "
+                          "(use_gating — это подпункт 2 изолированно)")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--warmup_steps", type=int, default=200)
     ap.add_argument("--weight_decay", type=float, default=0.1)
@@ -45,7 +66,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out_dir, exist_ok=True)
 
-    cfg = LoopedConfig(max_seq_len=args.seq_len, n_loops_train=args.n_loops_train)
+    cfg = LoopedConfig(max_seq_len=args.seq_len, n_loops_train=args.n_loops_train,
+                       use_step_scale=args.use_step_scale,
+                       use_loop_norm=args.use_loop_norm,
+                       use_loop_index_film=args.use_loop_index_film,
+                       use_trajectory=args.use_trajectory,
+                       use_momentum=args.use_momentum,
+                       use_gru_controller=args.use_gru_controller)
     model = LoopedTransformer(cfg).to(device)
     print(f"[model] параметров: {model.num_params():,}  |  device={device}")
 

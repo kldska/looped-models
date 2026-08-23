@@ -39,6 +39,74 @@ def eval_at_T(model, loader, cfg, n_loops, n_batches, device):
 
 
 @torch.no_grad()
+def get_learned_step_scales(model, max_loops, device):
+    """Если модель обучена с use_step_scale=True — читает, какую кривую
+    scale(t) она выучила, для каждого t от 1 до max_loops. Не требует
+    данных: scale(t) зависит только от t, не от входа."""
+    if model.step_scale is None:
+        return None
+    scales = []
+    for t in range(max_loops):
+        s = model.step_scale(t, device, torch.float32)
+        scales.append(s.item())
+    return scales
+
+
+@torch.no_grad()
+def get_loop_norm_trace(model, x, max_loops, device):
+    """Если модель обучена с use_loop_norm=True — прогоняет один батч и
+    записывает ||x|| после loop_norm на каждой итерации. В отличие от
+    step_scale, здесь норма — не выучиваемая функция t, а следствие
+    нормализации; ожидается, что она будет примерно константой на любом
+    T по построению (это и есть проверка гипотезы)."""
+    if model.loop_norm is None:
+        return None
+    x = x.to(device)
+    cos_ = model.rope_cos[: x.shape[1]].to(device)
+    sin_ = model.rope_sin[: x.shape[1]].to(device)
+    h = model.embed(x)
+    norms = []
+    for t in range(max_loops):
+        proposal = model.block(h, cos_, sin_, attn_mask=None)
+        h = model.loop_norm(proposal)
+        norms.append(h.norm(dim=-1).mean().item())
+    return norms
+
+
+@torch.no_grad()
+def get_loop_index_film_trace(model, max_loops, device):
+    """Если модель обучена с use_loop_index_film=True (гипотеза 2) —
+    читает выученные scale/shift FiLM по каждому t. Не требует данных:
+    как и step_scale, зависит только от t. Возвращает средний |scale|
+    и средний |shift| по каналам d_model — сводная метрика того,
+    насколько сильно FiLM модулирует вход на каждом шаге."""
+    if model.loop_index_film is None:
+        return None
+    fm = model.loop_index_film
+    scale_means, shift_means = [], []
+    for t in range(max_loops):
+        emb = fm._step_embedding(t, device, torch.float32)
+        film = fm.net(emb)
+        scale, shift = film.chunk(2, dim=-1)
+        scale_means.append(torch.tanh(scale).abs().mean().item())
+        shift_means.append(shift.abs().mean().item())
+    return {"mean_abs_scale_mult": scale_means, "mean_abs_shift": shift_means}
+
+
+@torch.no_grad()
+def get_trajectory_gate_trace(model, x, max_loops, device):
+    """Если модель обучена с use_trajectory=True (гипотеза 4) — прогоняет
+    один батч через полный forward-цикл с гейтом и памятью, записывает
+    средний gate по каждой итерации (в отличие от step_scale/loop_norm,
+    здесь это НЕ функция одного t, а зависит от накопленной истории,
+    поэтому нужны реальные данные, не только номер шага)."""
+    if model.trajectory is None:
+        return None
+    _, gate_means = model(x.to(device), n_loops=max_loops, return_gates=True)
+    return gate_means
+
+
+@torch.no_grad()
 def diagnose_fixed_point(model, x, cfg, max_loops, device):
     """Прогоняет один батч через до max_loops итераций и на каждом шаге
     считает норму состояния и cos-similarity с предыдущим шагом —
@@ -74,6 +142,9 @@ def main():
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # weights_only=False: чекпоинт хранит LoopedConfig (обычный python-объект),
+    # а PyTorch>=2.6 по умолчанию блокирует загрузку не-тензорных объектов
+    # из соображений безопасности. Это безопасно, т.к. чекпоинт — наш собственный.
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     cfg: LoopedConfig = ckpt["cfg"]
     model = LoopedTransformer(cfg).to(device)
@@ -95,11 +166,37 @@ def main():
     x, _ = next(iter(val_loader2))
     diag = diagnose_fixed_point(model, x, cfg, max(loop_counts), device)
 
+    learned_scales = get_learned_step_scales(model, max(loop_counts), device)
+    if learned_scales is not None:
+        print(f"\nВыученный scale(t), t=1..{max(loop_counts)}:")
+        print([round(s, 3) for s in learned_scales])
+
+    loop_norm_trace = get_loop_norm_trace(model, x, max(loop_counts), device)
+    if loop_norm_trace is not None:
+        print(f"\n||x|| после loop_norm, t=1..{max(loop_counts)} "
+              f"(должно быть примерно константой):")
+        print([round(n, 2) for n in loop_norm_trace])
+
+    film_trace = get_loop_index_film_trace(model, max(loop_counts), device)
+    if film_trace is not None:
+        print(f"\nFiLM (гипотеза 2), t=1..{max(loop_counts)}:")
+        print("  |scale-множитель-1|:", [round(s, 3) for s in film_trace["mean_abs_scale_mult"]])
+        print("  |shift|:", [round(s, 3) for s in film_trace["mean_abs_shift"]])
+
+    trajectory_gates = get_trajectory_gate_trace(model, x, max(loop_counts), device)
+    if trajectory_gates is not None:
+        print(f"\nGate (гипотеза 4, зависит от истории), t=1..{max(loop_counts)}:")
+        print([round(g, 3) for g in trajectory_gates])
+
     import os
     os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
     with open(args.out_json, "w") as f:
         json.dump({"trained_T": cfg.n_loops_train, "curve": curve,
-                   "fixed_point_diagnostics": diag}, f, indent=2)
+                   "fixed_point_diagnostics": diag,
+                   "learned_step_scales": learned_scales,
+                   "loop_norm_trace": loop_norm_trace,
+                   "loop_index_film_trace": film_trace,
+                   "trajectory_gate_trace": trajectory_gates}, f, indent=2)
     print(f"\nСохранено: {args.out_json}")
 
 
