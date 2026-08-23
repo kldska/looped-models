@@ -31,6 +31,14 @@ def main():
     ap.add_argument("--max_tokens", type=int, default=20_000_000,
                      help="суммарный бюджет токенов обучения (<=100M по заданию)")
     ap.add_argument("--n_loops_train", type=int, default=8)
+    ap.add_argument("--use_step_scale", action="store_true",
+                     help="включить обучаемый scale(t), зависящий от номера лупа "
+                          "(вариант A — без истории, но НЕ обобщается за пределы "
+                          "виденных при обучении T)")
+    ap.add_argument("--use_loop_norm", action="store_true",
+                     help="включить структурную RMSNorm residual stream после "
+                          "каждого лупа (вариант C — не зависит от t вообще, "
+                          "корректно определена для любого T)")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--warmup_steps", type=int, default=200)
     ap.add_argument("--weight_decay", type=float, default=0.1)
@@ -45,7 +53,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out_dir, exist_ok=True)
 
-    cfg = LoopedConfig(max_seq_len=args.seq_len, n_loops_train=args.n_loops_train)
+    cfg = LoopedConfig(max_seq_len=args.seq_len, n_loops_train=args.n_loops_train,
+                       use_step_scale=args.use_step_scale,
+                       use_loop_norm=args.use_loop_norm)
     model = LoopedTransformer(cfg).to(device)
     print(f"[model] параметров: {model.num_params():,}  |  device={device}")
 
